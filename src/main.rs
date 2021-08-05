@@ -1,128 +1,212 @@
-extern crate reqwest;
-extern crate json;
-extern crate serde;
-extern crate serde_xml_rs;
-extern crate serde_derive;
-extern crate serde_json;
-extern crate tokio;
+#[macro_use]
+extern crate slog;
+extern crate slog_async;
+extern crate slog_term;
+extern crate actix_web;
 
-use std::collections::{HashMap, BTreeMap};
-use json::object;
-use std::iter::FromIterator;
-use std::array::IntoIter;
-use tokio::runtime;
+use slog::{Drain, Fuse, Level, Never, FilterFn, Record, LevelFilter, Logger, Discard};
+use slog_async::Async;
+use slog_term::{FullFormat, PlainDecorator, TermDecorator};
+use std::fs::{OpenOptions, create_dir_all};
+use std::iter::Filter;
+use actix_web::{HttpRequest, HttpResponse};
+use std::env::{vars, var};
+use std::env::consts::OS;
+use std::str::FromStr;
+use std::io;
+use std::io::prelude::*;
 
-struct DataServiceConfig {
-    rootUrl: String,
+struct LoggingService {
+    errorLogger: Logger,
+    infoLogger: Logger,
+    requestsLogger: Logger,
 }
 
-impl DataServiceConfig {
-    pub fn new(rootUrl: String) -> Self {
-        Self {
-            rootUrl
-        }
+impl LoggingService {
+    fn generateConsoleDrain() -> Fuse<Async> {
+        return Async::new(FullFormat::new(TermDecorator::new().build()).build().fuse()).build().fuse();
     }
-}
 
-struct DataServiceRequestOpts {
-    token: String,
-    method: reqwest::Method,
-    body: String,
-    params: HashMap<String, String>,
-    urlPath: String,
-    headers: HashMap<String, String>,
-}
-
-impl DataServiceRequestOpts {
-    pub fn new(token: String, method: reqwest::Method, body: String, params: HashMap<String, String>, urlPath: String, headers: HashMap<String, String>) -> Self {
-        Self {
-            token, method, body, params, urlPath, headers
+    fn generateFileDrain(directory: String, fileName: String) -> Fuse<Async> {
+        let createDirResult = create_dir_all(std::path::Path::new(directory.as_str()));
+        if createDirResult.is_err() {
+            println!("Log directory creation failed. Reverting to stdout logging...");
+            return Self::generateConsoleDrain();
         }
-    }
-}
-
-struct DataServiceResponseObject {
-    rawData: String,
-    dataObject: serde_json::Value,
-}
-
-impl Default for DataServiceResponseObject {
-    fn default() -> Self {
-        return Self { rawData: "".to_owned(), dataObject: serde_json::from_str("{\"data\": \"\"}").unwrap() };
-    }
-}
-
-impl From<reqwest::Response> for DataServiceResponseObject {
-    fn from(response: reqwest::Response) -> Self {
-        let mut newObject : &mut DataServiceResponseObject = &mut DataServiceResponseObject::default();
-        //assert_eq!(response.status().as_str(), "");
-        if !(response.status().is_success()) {
-            return Self {
-                rawData: "".to_owned(), dataObject: serde_json::from_str("{\"data\": \"\"}").unwrap()
-            };
-        }
-        let tempData = futures::executor::block_on(response.text());
-        if tempData.is_err() {
-            return Self {
-                rawData: "".to_owned(), dataObject: serde_json::from_str("{\"data\": \"\"}").unwrap()
-            };
-        }
-        let tempDataUnwrapped: &String = &(tempData.unwrap());
-        newObject.rawData = tempDataUnwrapped.as_str().to_owned();
-        let jsonOut: Result<serde_json::Value, _> = serde_json::from_str(newObject.rawData.as_str());
-        //assert_eq!(tempDataUnwrapped, "");
-        //assert_eq!(jsonOut.is_ok().to_string(), ""); //err().unwrap().to_string(), "");
-        if jsonOut.is_ok() {
-            newObject.dataObject = jsonOut.unwrap();
+        let mut fullPath: String = directory.clone();
+        fullPath.push_str(fileName.as_str());
+        fullPath.push_str(".log");
+        let fileResult = OpenOptions::new().create(true).write(true).truncate(true).open(fullPath);
+        if fileResult.is_err() {
+            println!("Log file creation failed. Reverting to stdout logging...");
+            return Self::generateConsoleDrain();
         } else {
-            let xmlOut = serde_xml_rs::from_str(newObject.rawData.as_str());
-            if xmlOut.is_ok() {
-                newObject.dataObject = xmlOut.unwrap();
+            let file = fileResult.unwrap();
+            return Async::new(FullFormat::new(PlainDecorator::new(file)).build().fuse()).build().fuse();
+        }
+    }
+
+    pub fn initStdout(useEnvVar: bool) -> Self {
+        if useEnvVar {
+            let mut logLevel = Level::Debug;
+            let initialLogLevel = var("NTX_LOG_LEVEL");
+            if initialLogLevel.is_err() {
+                println!("Could not obtain log level from environment variable. Defaulting to DEBUG level...");
             } else {
-                newObject.dataObject = serde_json::from_str("{\"data\": \"\"}").unwrap();
+                let processedLogLevel = Level::from_str(initialLogLevel.unwrap().as_str());
+                if processedLogLevel.is_err() {
+                    println!("Invalid log level specified in environment variable. Defaulting to DEBUG level...");
+                } else {
+                    logLevel = processedLogLevel.unwrap();
+                }
             }
-        }
-        // Insert custom data here
-        return Self {
-            rawData: newObject.rawData.to_owned(), dataObject: newObject.dataObject.to_owned()
-        };
-    }
-}
-
-struct DataApiService {
-    rootUrl: String,
-    client: reqwest::Client,
-    //setup: (inputConfig: DataServiceConfig) -> Self,
-    //request: (opts: DataServiceRequestOpts) -> reqwest::Response,
-}
-
-impl Default for DataApiService {
-    fn default() -> Self {
-        return Self { rootUrl: "".to_owned(), client: reqwest::Client::new() };
-    }
-}
-
-impl DataApiService {
-    pub fn setup(mut inputConfig: DataServiceConfig) -> Self {
-        Self { rootUrl: inputConfig.rootUrl.to_owned(), client: reqwest::Client::new() }
-    }
-    pub async fn request(&self, opts: DataServiceRequestOpts) -> reqwest::Response {
-        let mut headersVar = reqwest::header::HeaderMap::new();
-        for (key, value) in &opts.headers {
-            headersVar.insert(reqwest::header::HeaderName::from_lowercase(key.to_lowercase().as_bytes()).unwrap(), value.parse().unwrap());
-        }
-        let mut urlEnd: String = String::from("");
-        if opts.urlPath.starts_with("/") {
-            urlEnd = opts.urlPath.chars().skip(1).collect();
+            return Self {
+                errorLogger: Logger::root(Discard, o!()),
+                infoLogger: Logger::root(Self::generateConsoleDrain().filter_level(logLevel).fuse(), o!()),
+                requestsLogger: Logger::root(Self::generateConsoleDrain().filter_level(Level::Trace).fuse(), o!()),
+            };
         } else {
-            urlEnd = String::from(opts.urlPath.clone()).clone();
+            return Self {
+                errorLogger: Logger::root(Discard, o!()),
+                infoLogger: Logger::root(Self::generateConsoleDrain().filter_level(Level::Debug).fuse(), o!()),
+                requestsLogger: Logger::root(Self::generateConsoleDrain().filter_level(Level::Trace).fuse(), o!()),
+            };
         }
-        let mut urlTotal = self.rootUrl.as_str().to_owned();
-        urlTotal.push_str(urlEnd.as_str());
-        let tokioRuntime = runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        return tokioRuntime.block_on(async {
-            return self.client.request(opts.method.clone().to_owned(), urlTotal.clone().as_str()).body(opts.body.to_owned()).bearer_auth(opts.token.to_owned()).headers(headersVar).query(&opts.params.to_owned()).send().await.unwrap();
-        });
+    }
+
+    pub fn initFile(logDir: String, useEnvVar: bool) -> Self {
+        if useEnvVar {
+            let mut logLevel = Level::Debug;
+            let initialLogLevel = var("NTX_LOG_LEVEL");
+            if initialLogLevel.is_err() {
+                println!("Could not obtain log level from environment variable. Defaulting to DEBUG level...");
+            } else {
+                let processedLogLevel = Level::from_str(initialLogLevel.unwrap().as_str());
+                if processedLogLevel.is_err() {
+                    println!("Invalid log level specified in environment variable. Defaulting to DEBUG level...");
+                } else {
+                    logLevel = processedLogLevel.unwrap();
+                }
+            }
+            return Self {
+                errorLogger: Logger::root(Self::generateFileDrain(logDir.clone(), "error".to_owned()).filter_level(Level::Error).fuse(), o!()),
+                infoLogger: Logger::root(Self::generateFileDrain(logDir.clone(), "info".to_owned()).filter_level(logLevel).fuse(), o!()),
+                requestsLogger: Logger::root(Self::generateFileDrain(logDir.clone(), "requests".to_owned()).filter_level(Level::Trace).fuse(), o!()),
+            };
+        } else {
+            return Self {
+                errorLogger: Logger::root(Self::generateFileDrain(logDir.clone(), "error".to_owned()).filter_level(Level::Error).fuse(), o!()),
+                infoLogger: Logger::root(Self::generateFileDrain(logDir.clone(), "info".to_owned()).filter_level(Level::Debug).fuse(), o!()),
+                requestsLogger: Logger::root(Self::generateFileDrain(logDir.clone(), "requests".to_owned()).filter_level(Level::Trace).fuse(), o!()),
+            };
+        }
+    }
+
+    fn logItemToLogger(&self, logText: String, loggerType: i32, logLevel: Level) {
+        let logger = if loggerType == 0 { self.errorLogger.clone() } else if loggerType == 1 { self.infoLogger.clone() } else { self.requestsLogger.clone() };
+        if matches!(logLevel, Level::Trace) {
+            slog_trace!(logger, "{}", logText.as_str());
+        } else if matches!(logLevel, Level::Debug) {
+            slog_debug!(logger, "{}", logText.as_str());
+        } else if matches!(logLevel, Level::Info) {
+            slog_info!(logger, "{}", logText.as_str());
+        } else if matches!(logLevel, Level::Warning) {
+            slog_warn!(logger, "{}", logText.as_str());
+        } else if matches!(logLevel, Level::Error) {
+            slog_error!(logger, "{}", logText.as_str());
+        } else if matches!(logLevel, Level::Critical) {
+            slog_crit!(logger, "{}", logText.as_str());
+        }
+    }
+
+    fn logItemInternal(&self, logText: String, logLevel: Level, useError: bool, useInfo: bool, useRequests: bool) {
+        if useError {
+            self.logItemToLogger(logText.clone(), 0, logLevel);
+        } if useInfo {
+            self.logItemToLogger(logText.clone(), 1, logLevel);
+        } if useRequests {
+            self.logItemToLogger(logText.clone(), 2, logLevel);
+        }
+    }
+
+    fn logItem(&self, logText: String, logLevel: Level, isRequests: bool) {
+        let mut finalText: String = OS.to_owned();
+        finalText.push_str("\r\n");
+        for variable in vars() {
+            finalText.push_str(variable.0.as_str());
+            finalText.push_str("=");
+            finalText.push_str(variable.1.as_str());
+            finalText.push_str("; ");
+        }
+        finalText.push_str("\r\n");
+        finalText.push_str(logText.as_str());
+        self.logItemInternal(finalText, logLevel, !isRequests, !isRequests, isRequests);
+    }
+
+    pub fn logText(&self, logText: String, logLevel: Level) {
+        self.logItem(logText, logLevel, false);
+    }
+
+    pub fn logActixRequest(&self, logRequest: HttpRequest) {
+        let mut requestString: String = logRequest.method().as_str().to_owned();
+        requestString.push_str(" ");
+        requestString.push_str(logRequest.uri().to_string().as_str());
+        requestString.push_str("\r\n");
+        for headerKey in logRequest.headers().keys() {
+            requestString.push_str(logRequest.headers().get(headerKey.to_owned()).unwrap().to_str().unwrap());
+            requestString.push_str("\r\n");
+        }
+        self.logItem(requestString, Level::Info, true);
+    }
+
+    pub fn logActixResponse(&self, logRequest: HttpResponse) {
+        let mut responseString: String = logRequest.status().to_string();
+        responseString.push_str("\r\n");
+        for headerKey in logRequest.headers().keys() {
+            responseString.push_str(logRequest.headers().get(headerKey.to_owned()).unwrap().to_str().unwrap());
+            responseString.push_str("\r\n");
+        }
+        self.logItem(responseString, Level::Info, true);
+    }
+
+    pub fn logError(&self, logText: String) {
+        self.logText(logText, Level::Error)
+    }
+
+    pub fn logWarning(&self, logText: String) {
+        self.logText(logText, Level::Warning)
+    }
+
+    pub fn logInfo(&self, logText: String) {
+        self.logText(logText, Level::Info)
+    }
+
+    pub fn logDebug(&self, logText: String) {
+        self.logText(logText, Level::Debug)
+    }
+
+    pub fn logServerEventAsError(&self, logText: String) {
+        let mut finalText: String = "Server Event - ".to_owned();
+        finalText.push_str(logText.as_str());
+        self.logError(finalText);
+    }
+
+    pub fn logServerEventAsWarning(&self, logText: String) {
+        let mut finalText: String = "Server Event - ".to_owned();
+        finalText.push_str(logText.as_str());
+        self.logWarning(finalText);
+    }
+
+    pub fn logServerEventAsInfo(&self, logText: String) {
+        let mut finalText: String = "Server Event - ".to_owned();
+        finalText.push_str(logText.as_str());
+        self.logInfo(finalText);
+    }
+
+    pub fn logServerEventAsDebug(&self, logText: String) {
+        let mut finalText: String = "Server Event - ".to_owned();
+        finalText.push_str(logText.as_str());
+        self.logDebug(finalText);
     }
 }
 
@@ -131,22 +215,70 @@ mod tests {
     use super::*;
     use std::array::IntoIter;
     use std::iter::FromIterator;
+    use actix_web::test::TestRequest;
+    use std::path::Path;
+    use std::fs::File;
+    use actix_web::http::Method;
 
     #[test]
-    fn test_setup() {
-        let apiService: DataApiService = DataApiService::setup(DataServiceConfig::new("https://example.com/".to_owned()));
-        let apiService2: DataApiService = DataApiService::setup(DataServiceConfig::new("https://example.org/".to_owned()));
-        assert_eq!(apiService.rootUrl, "https://example.com/");
-        assert_eq!(apiService2.rootUrl, "https://example.org/");
-    }
-
-    #[test]
-    fn test_request() {
-        let apiService: DataApiService = DataApiService::setup(DataServiceConfig::new("http://dummy.restapiexample.com/api/v1/employee/1".to_owned()));
-        let response: reqwest::Response = futures::executor::block_on(apiService.request(DataServiceRequestOpts::new("".to_owned(), reqwest::Method::GET, "".to_owned(), HashMap::<_, _>::from_iter(IntoIter::new([/*("123".to_owned(), "456".to_owned()), ("abc".to_owned(), "def".to_owned())*/])), "".to_owned(), HashMap::<_, _>::from_iter(IntoIter::new([])))));
-        let output: DataServiceResponseObject = DataServiceResponseObject::from(response);
-        //assert_eq!(serde_json::to_string(&output.dataObject).unwrap(), "");
-        assert_eq!(output.dataObject.get("status").unwrap().as_str().unwrap(), "success");
+    fn performTests() {
+        let logger1: LoggingService = LoggingService::initStdout(false);
+        let logger2: LoggingService = LoggingService::initStdout(true);
+        // For testing, NTX_LOG_LEVEL = "INFO"
+        assert_eq!(logger1.infoLogger.is_debug_enabled(), true);
+        assert_eq!(logger2.infoLogger.is_debug_enabled(), false);
+        let mut baseDir: String = "C:\\Users\\user\\Documents\\".to_owned();
+        baseDir.push_str("this-directory-does-not-exist\\THIS_DIRECTORY_DOES_NOT_EXIST\\");
+        let logger3: LoggingService = LoggingService::initFile(baseDir.clone(), false);
+        baseDir.push_str("2\\");
+        let logger4: LoggingService = LoggingService::initFile(baseDir.clone(), true);
+        assert_eq!(logger3.infoLogger.is_debug_enabled(), true);
+        assert_eq!(logger4.infoLogger.is_debug_enabled(), false);
+        logger3.logError("Error".to_owned());
+        logger3.logWarning("Warn".to_owned());
+        logger3.logInfo("Info".to_owned());
+        logger3.logDebug("Debug".to_owned());
+        logger3.logServerEventAsError("Server Error".to_owned());
+        logger4.logWarning("Warn".to_owned());
+        logger4.logInfo("Info".to_owned());
+        logger4.logDebug("Debug".to_owned());
+        let httpRequest: HttpRequest = TestRequest::with_header("content-type", "text/plain")
+            .uri("https://www.google.com/")
+            .method(Method::GET)
+            .to_http_request();
+        logger3.logActixRequest(httpRequest);
+        let baseDir2: String = Path::new(baseDir.as_str()).parent().unwrap().to_str().unwrap().to_owned();
+        let file1: String = Path::new(baseDir.as_str()).join("info.log").to_str().unwrap().to_owned();
+        let file2: String = Path::new(baseDir.as_str()).join("error.log").to_str().unwrap().to_owned();
+        let file3: String = Path::new(baseDir.as_str()).join("requests.log").to_str().unwrap().to_owned();
+        let file4: String = Path::new(baseDir2.as_str()).join("info.log").to_str().unwrap().to_owned();
+        let file5: String = Path::new(baseDir2.as_str()).join("error.log").to_str().unwrap().to_owned();
+        let file6: String = Path::new(baseDir2.as_str()).join("requests.log").to_str().unwrap().to_owned();
+        let mut buffer = String::new();
+        let mut part1: File = File::open(file1).unwrap();
+        let mut part2: File = File::open(file2).unwrap();
+        let mut part3: File = File::open(file3).unwrap();
+        let mut part4: File = File::open(file4).unwrap();
+        let mut part5: File = File::open(file5).unwrap();
+        let mut part6: File = File::open(file6).unwrap();
+        part1.read_to_string(&mut buffer);
+        println!("{}", buffer);
+        buffer = String::new();
+        part2.read_to_string(&mut buffer);
+        println!("{}", buffer);
+        buffer = String::new();
+        part3.read_to_string(&mut buffer);
+        println!("{}", buffer);
+        buffer = String::new();
+        part4.read_to_string(&mut buffer);
+        println!("{}", buffer);
+        buffer = String::new();
+        part5.read_to_string(&mut buffer);
+        println!("{}", buffer);
+        buffer = String::new();
+        part6.read_to_string(&mut buffer);
+        println!("{}", buffer);
+        buffer = String::new();
     }
 }
 
