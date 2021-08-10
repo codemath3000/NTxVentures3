@@ -30,16 +30,14 @@ impl LoggingService {
     fn generateFileDrain(directory: String, fileName: String) -> Fuse<Async> {
         let createDirResult = create_dir_all(std::path::Path::new(directory.as_str()));
         if createDirResult.is_err() {
-            println!("Log directory creation failed. Reverting to stdout logging...");
-            return Self::generateConsoleDrain();
+            panic!("Log directory creation failed.");
         }
         let mut fullPath: String = directory.clone();
         fullPath.push_str(fileName.as_str());
         fullPath.push_str(".log");
         let fileResult = OpenOptions::new().create(true).write(true).truncate(true).open(fullPath);
         if fileResult.is_err() {
-            println!("Log file creation failed. Reverting to stdout logging...");
-            return Self::generateConsoleDrain();
+            panic!("Log file creation failed.");
         } else {
             let file = fileResult.unwrap();
             return Async::new(FullFormat::new(PlainDecorator::new(file)).build().fuse()).build().fuse();
@@ -51,11 +49,11 @@ impl LoggingService {
             let mut logLevel = Level::Debug;
             let initialLogLevel = var("NTX_LOG_LEVEL");
             if initialLogLevel.is_err() {
-                println!("Could not obtain log level from environment variable. Defaulting to DEBUG level...");
+                panic!("Could not obtain log level from environment variable.");
             } else {
                 let processedLogLevel = Level::from_str(initialLogLevel.unwrap().as_str());
                 if processedLogLevel.is_err() {
-                    println!("Invalid log level specified in environment variable. Defaulting to DEBUG level...");
+                    panic!("Invalid log level specified in environment variable.");
                 } else {
                     logLevel = processedLogLevel.unwrap();
                 }
@@ -79,11 +77,11 @@ impl LoggingService {
             let mut logLevel = Level::Debug;
             let initialLogLevel = var("NTX_LOG_LEVEL");
             if initialLogLevel.is_err() {
-                println!("Could not obtain log level from environment variable. Defaulting to DEBUG level...");
+                panic!("Could not obtain log level from environment variable.");
             } else {
                 let processedLogLevel = Level::from_str(initialLogLevel.unwrap().as_str());
                 if processedLogLevel.is_err() {
-                    println!("Invalid log level specified in environment variable. Defaulting to DEBUG level...");
+                    panic!("Invalid log level specified in environment variable.");
                 } else {
                     logLevel = processedLogLevel.unwrap();
                 }
@@ -104,18 +102,13 @@ impl LoggingService {
 
     fn logItemToLogger(&self, logText: String, loggerType: i32, logLevel: Level) {
         let logger = if loggerType == 0 { self.errorLogger.clone() } else if loggerType == 1 { self.infoLogger.clone() } else { self.requestsLogger.clone() };
-        if matches!(logLevel, Level::Trace) {
-            slog_trace!(logger, "{}", logText.as_str());
-        } else if matches!(logLevel, Level::Debug) {
-            slog_debug!(logger, "{}", logText.as_str());
-        } else if matches!(logLevel, Level::Info) {
-            slog_info!(logger, "{}", logText.as_str());
-        } else if matches!(logLevel, Level::Warning) {
-            slog_warn!(logger, "{}", logText.as_str());
-        } else if matches!(logLevel, Level::Error) {
-            slog_error!(logger, "{}", logText.as_str());
-        } else if matches!(logLevel, Level::Critical) {
-            slog_crit!(logger, "{}", logText.as_str());
+        match logLevel {
+            Level::Trace => { slog_trace!(logger, "{}", logText.as_str()); }
+            Level::Debug => { slog_debug!(logger, "{}", logText.as_str()); }
+            Level::Info => { slog_info!(logger, "{}", logText.as_str()); }
+            Level::Warning => { slog_warn!(logger, "{}", logText.as_str()); }
+            Level::Error => { slog_error!(logger, "{}", logText.as_str()); }
+            Level::Critical => { slog_crit!(logger, "{}", logText.as_str()); }
         }
     }
 
